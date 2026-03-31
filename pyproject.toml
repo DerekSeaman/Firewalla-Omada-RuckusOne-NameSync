@@ -1,0 +1,11 @@
+[project]
+name = "firewalla-mac-sync"
+version = "1.0.0"
+requires-python = ">=3.8"
+dependencies = ["requests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
