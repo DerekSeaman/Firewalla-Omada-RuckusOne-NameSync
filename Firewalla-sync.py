@@ -5,7 +5,7 @@ Syncs device names from the Firewalla cloud API to network management platforms.
 
 Currently supported platforms
 ------------------------------
-  omada   TP-Link Omada controller (via tplink-omada-api CLI)
+  omada   TP-Link Omada controller (via direct REST API)
   ruckus  Ruckus One cloud controller (via REST API)
 
 Adding a new platform
@@ -34,7 +34,6 @@ from __future__ import annotations
 import argparse
 import configparser
 import re
-import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -58,8 +57,7 @@ BASE_REQUIRED_KEYS = ['FIREWALLA_API_TOKEN', 'FIREWALLA_MSP_ID']
 
 # Config keys required per platform — only validated when that platform is active
 PLATFORM_REQUIRED_KEYS: dict[str, list[str]] = {
-    # Omada uses the tplink-omada-api CLI, which manages its own connection config
-    'omada': [],
+    'omada': ['OMADA_URL', 'OMADA_USERNAME', 'OMADA_PASSWORD'],
     'ruckus': [
         'RUCKUS_CLIENT_ID',
         'RUCKUS_CLIENT_SECRET',
@@ -68,7 +66,8 @@ PLATFORM_REQUIRED_KEYS: dict[str, list[str]] = {
     ],
 }
 
-_OMADA_CLI_TIMEOUT      = 30   # seconds before a hung omada subprocess is killed
+_OMADA_REQUEST_TIMEOUT  = 10   # seconds for all Omada HTTP requests
+_OMADA_NOT_FOUND_CODE   = -41011  # Omada error code when the client MAC is unknown
 _RUCKUS_REQUEST_TIMEOUT = 10   # seconds for all Ruckus HTTP requests
 
 # Allowlist for RUCKUS_REGION — any other value is rejected at startup.
@@ -377,53 +376,176 @@ class Platform(ABC):
 
 
 class OmadaPlatform(Platform):
-    """TP-Link Omada controller via the tplink-omada-api CLI.
+    """TP-Link Omada SDN controller via direct REST API.
 
-    Requirements
-    ------------
-    - Install the CLI: https://github.com/MarkGodwin/tplink-omada-api
-    - The ``omada`` command must be on your PATH and pre-configured with
-      your controller address and credentials.
+    Required secrets.conf keys
+    --------------------------
+    OMADA_URL         Full URL of the controller, e.g. https://192.168.1.1:8043
+    OMADA_USERNAME    Admin username
+    OMADA_PASSWORD    Admin password
+    OMADA_SITE        Site name to sync (default: Default)
+    OMADA_VERIFY_SSL  Set to 'false' to skip TLS certificate verification (default: true)
 
-    Note: The Omada CLI does not provide a command to read current client
-    names, so unchanged detection is not supported. Every run pushes all
-    device names to the controller.
+    Controller firmware 5.1+ is required.
     """
+
+    def __init__(
+        self,
+        config: configparser.SectionProxy,
+        dry_run: bool = False,
+        quiet: bool = False,
+        force_all: bool = False,
+    ) -> None:
+        super().__init__(config, dry_run, quiet, force_all)
+        self._authenticated = False
+        self._controller_id: str | None = None
+        self._site_id: str | None = None
+
+        url = config.get('OMADA_URL', '').rstrip('/')
+        if not url.lower().startswith(('http://', 'https://')):
+            url = 'https://' + url
+        self._url = url
+
+        self._username = config.get('OMADA_USERNAME', '')
+        self._password = config.get('OMADA_PASSWORD', '')
+        self._site_name = config.get('OMADA_SITE', 'Default')
+        self._verify_ssl = (
+            config.get('OMADA_VERIFY_SSL', 'true').lower().strip() != 'false'
+        )
+
+        if not self._verify_ssl:
+            # Suppress the urllib3 InsecureRequestWarning when SSL verification
+            # is intentionally disabled (e.g. self-signed controller certificate).
+            import urllib3  # noqa: PLC0415
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+        # Persistent session for cookie-based auth and HTTP keep-alive
+        self._session = requests.Session()
 
     @property
     def platform_name(self) -> str:
         return 'Omada'
 
     def sanitize_name(self, name: str) -> str:
-        """Strip leading hyphens to prevent the Omada CLI from interpreting
-        a device name (e.g. ``-help``) as a command-line flag.
-        """
+        """Strip leading hyphens — the Omada API treats them as invalid."""
         return name.lstrip('-')
 
-    def set_device_name(self, mac: str, name: str) -> str:
-        mac_hyphen = mac.replace(':', '-')
+    # ------------------------------------------------------------------
+    # Internal REST helpers
+    # ------------------------------------------------------------------
+
+    def _api_url(self, endpoint: str, site: bool = False) -> str:
+        """Build an Omada controller API v2 URL."""
+        base = f"{self._url}/{self._controller_id}/api/v2"
+        if site:
+            return f"{base}/sites/{self._site_id}/{endpoint}"
+        return f"{base}/{endpoint}"
+
+    def _request(self, method: str, url: str, **kwargs) -> dict:
+        """Perform an Omada REST request and return the full parsed JSON body."""
+        kwargs['verify'] = self._verify_ssl
+        kwargs.setdefault('timeout', _OMADA_REQUEST_TIMEOUT)
+        resp = _request_with_retry(lambda: self._session.request(method, url, **kwargs))
+        return resp.json()
+
+    # ------------------------------------------------------------------
+    # Authentication (cached after first call)
+    # ------------------------------------------------------------------
+
+    def _authenticate(self) -> None:
+        """Log in to the Omada controller and resolve the target site ID.
+
+        Three-step sequence:
+          1. GET /api/info            — fetch controller ID (unauthenticated)
+          2. POST /api/v2/login       — obtain CSRF token; session cookie set
+          3. GET /api/v2/users/current — resolve site name → site ID
+        """
+        if self._authenticated:
+            return
+
+        print("  Authenticating...", end=' ', flush=True)
+
+        # Step 1 — controller info
         try:
-            result = subprocess.run(
-                ['omada', 'set-client-name', '--', mac_hyphen, name],
-                capture_output=True,
-                text=True,
-                timeout=_OMADA_CLI_TIMEOUT,
-            )
-        except subprocess.TimeoutExpired:
-            return 'failed'
-        except FileNotFoundError:
+            data = self._request('get', f"{self._url}/api/info")
+            self._controller_id = data['result']['omadacId']
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            print("FAILED", file=sys.stderr)
             raise SyncError(
-                "Error: 'omada' CLI not found. Is it installed and on your PATH?",
+                f"  Omada: could not reach controller at {self._url}: {e}",
+                EXIT_AUTH_ERROR,
+            ) from e
+
+        # Step 2 — login
+        try:
+            data = self._request(
+                'post', self._api_url('login'),
+                json={'username': self._username, 'password': self._password},
+            )
+            code = data.get('errorCode', -1)
+            if code != 0:
+                print("FAILED", file=sys.stderr)
+                raise SyncError(
+                    f"  Omada login failed (code {code}): {data.get('msg', '')}",
+                    EXIT_AUTH_ERROR,
+                )
+            self._session.headers.update({
+                'Csrf-Token': data['result']['token'],
+                'Omada-Request-Source': 'web-local',
+                'Referer': self._url + '/',
+                'Origin': self._url,
+            })
+        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+            print("FAILED", file=sys.stderr)
+            raise SyncError(f"  Omada login request failed: {e}", EXIT_AUTH_ERROR) from e
+
+        # Step 3 — resolve site name → site ID
+        try:
+            data = self._request('get', self._api_url('users/current'))
+            sites = data.get('result', {}).get('privilege', {}).get('sites', [])
+            self._site_id = next(
+                (s['key'] for s in sites if s['name'] == self._site_name), None
+            )
+        except (requests.exceptions.RequestException, ValueError) as e:
+            print("FAILED", file=sys.stderr)
+            raise SyncError(f"  Omada site lookup failed: {e}", EXIT_AUTH_ERROR) from e
+
+        if self._site_id is None:
+            print("FAILED", file=sys.stderr)
+            available = ', '.join(s['name'] for s in sites)
+            raise SyncError(
+                f"  Omada site '{self._site_name}' not found. "
+                f"Available sites: {available}",
                 EXIT_CONFIG_ERROR,
             )
 
-        if result.returncode == 0:
-            return 'updated'
-        if '-41011' in result.stderr:
-            return 'not_found'
-        if result.stderr.strip():
-            print(f"  Omada error: {result.stderr.strip()}", file=sys.stderr)
-        return 'failed'
+        self._authenticated = True
+        print("OK")
+
+    # ------------------------------------------------------------------
+    # Platform hook
+    # ------------------------------------------------------------------
+
+    def set_device_name(self, mac: str, name: str) -> str:
+        """PATCH the client alias via the Omada REST API."""
+        self._authenticate()
+        mac_hyphen = mac.replace(':', '-')
+        url = self._api_url(f"clients/{mac_hyphen}", site=True)
+        try:
+            data = self._request('patch', url, json={'name': name})
+            code = data.get('errorCode', -1)
+            if code == 0:
+                return 'updated'
+            if code == _OMADA_NOT_FOUND_CODE:
+                return 'not_found'
+            print(
+                f"  Omada error {code} for {mac}: {data.get('msg', '')}",
+                file=sys.stderr,
+            )
+            return 'failed'
+        except requests.exceptions.RequestException as e:
+            print(f"  Warning: Omada request failed for {mac}: {e}", file=sys.stderr)
+            return 'failed'
 
 
 # ---------------------------------------------------------------------------
@@ -744,8 +866,8 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 platforms:
-  omada    TP-Link Omada  (requires tplink-omada-api CLI)
-  ruckus   Ruckus One     (requires API credentials in secrets.conf)
+  omada    TP-Link Omada  (requires OMADA_* credentials in secrets.conf)
+  ruckus   Ruckus One     (requires RUCKUS_* credentials in secrets.conf)
 
 examples:
   python Firewalla-sync.py

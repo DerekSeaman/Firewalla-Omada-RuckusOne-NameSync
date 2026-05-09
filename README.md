@@ -13,7 +13,7 @@ On subsequent runs, devices whose name already matches are skipped entirely
 
 | Platform | Method | Notes |
 | --- | --- | --- |
-| **TP-Link Omada** | [`tplink-omada-api`][tplink-omada-api] CLI | Local controller access required |
+| **TP-Link Omada** | REST API | Local controller access required; firmware 5.1+ |
 | **Ruckus One** | REST API | Cloud-based; reachable from anywhere (see note below) |
 
 > **Ruckus One note:** The Ruckus One APIs support setting and reading client
@@ -31,8 +31,8 @@ The script is designed to make adding new platforms straightforward — see
 3. Filters out entries with invalid/missing MAC addresses or empty names
 4. For each selected platform:
    - Pushes updated names and prints a per-platform summary
-   - **Omada:** pushes all device names on every run (the CLI does not
-     support reading current names)
+   - **Omada:** authenticates directly to the controller REST API and
+     pushes all device names on every run
    - **Ruckus One:** fetches known WiFi client MACs and current aliases
      first, then only pushes names that have changed — devices not
      recognized by Ruckus are reported as "not found" without making
@@ -42,23 +42,14 @@ The script is designed to make adding new platforms straightforward — see
 ## Requirements
 
 - **Python 3.8+**
-- **[`requests`](https://pypi.org/project/requests/)** — HTTP client
+- **[`requests`](https://pypi.org/project/requests/)** — HTTP client (the only dependency)
 
 ```bash
 pip install requests
 ```
 
-### Omada (optional)
-
-The Omada platform requires the `omada` CLI from
-[tplink-omada-api][tplink-omada-api]. Install it and configure your
-controller address and credentials before running the script. The `omada`
-command must be on your `PATH`.
-
-### Ruckus One (optional)
-
-No additional tools needed — the script talks directly to the Ruckus One
-cloud REST API. Credentials are configured in `secrets.conf`.
+No additional tools or CLI utilities are required. Both platforms are accessed
+via direct REST API calls.
 
 ## Configuration
 
@@ -78,6 +69,13 @@ to prevent accidental commits.
 FIREWALLA_API_TOKEN=your_token_here
 FIREWALLA_MSP_ID=your-msp-id
 
+# Omada SDN controller — only required when using --platform omada
+OMADA_URL=https://192.168.1.1:8043
+OMADA_USERNAME=your_omada_username
+OMADA_PASSWORD=your_omada_password
+OMADA_SITE=Default
+OMADA_VERIFY_SSL=true
+
 # Ruckus One — only required when using --platform ruckus
 RUCKUS_CLIENT_ID=your_client_id_here
 RUCKUS_CLIENT_SECRET=your_client_secret_here
@@ -91,6 +89,11 @@ RUCKUS_REGION=us
 | --- | --- |
 | `FIREWALLA_API_TOKEN` | Firewalla MSP portal → Account → API Settings → Create Token |
 | `FIREWALLA_MSP_ID` | The subdomain of your MSP portal URL. If your portal is at `https://abc-xyz123.firewalla.net`, the MSP ID is `abc-xyz123`. |
+| `OMADA_URL` | The full URL of your Omada controller, including port. Software controller default: `https://<host>:8043`. Hardware controller default: `https://<host>:443`. |
+| `OMADA_USERNAME` | An Omada admin account username |
+| `OMADA_PASSWORD` | Password for the Omada admin account |
+| `OMADA_SITE` | The site name as shown in the Omada controller UI (default: `Default`) |
+| `OMADA_VERIFY_SSL` | Set to `false` only if your controller uses a self-signed certificate |
 | `RUCKUS_CLIENT_ID` | Ruckus One portal → Administration → Account Management → Settings → Application Tokens |
 | `RUCKUS_CLIENT_SECRET` | Same location as Client ID |
 | `RUCKUS_TENANT_ID` | The 32-character hex string in the Ruckus One portal URL: `https://ruckus.cloud/{tenant_id}/t/dashboard` |
@@ -218,15 +221,18 @@ step-by-step guide.
 
 ### Omada
 
+- Authenticates directly to the Omada controller REST API (firmware 5.1+ required);
+  no third-party CLI or tools are needed
+- Login is a three-step sequence: fetch controller ID → obtain CSRF token →
+  resolve site name to site ID. The session is cached for the duration of the run
 - MACs are converted from colon-separated (`aa:bb:cc:dd:ee:ff`) to
-  hyphen-separated (`aa-bb-cc-dd-ee-ff`) as required by the Omada CLI
-- Leading hyphens are stripped from device names to prevent CLI flag injection
-- The `--` end-of-options marker is used in subprocess calls for defense in depth
-- No unchanged detection — the Omada CLI does not support reading current
-  client names, so every run pushes all names
-- Subprocess calls have a 30-second timeout to prevent hangs
-- When the Omada CLI fails for an unexpected reason, its error output is
-  printed to help diagnose the issue
+  hyphen-separated (`aa-bb-cc-dd-ee-ff`) as required by the Omada API
+- Leading hyphens are stripped from device names (the Omada API treats them as invalid)
+- No unchanged detection — every run pushes all device names to the controller
+- All HTTP requests have a 10-second timeout with one automatic retry on
+  transient connection errors
+- Set `OMADA_VERIFY_SSL=false` when the controller uses a self-signed TLS certificate
+  (common for software controllers on a LAN); doing so suppresses urllib3 warnings
 
 ### Ruckus One
 
@@ -273,8 +279,9 @@ go to stderr — both are captured by `2>&1`.
 | `RUCKUS_TENANT_ID must be a 32-character hex string` | Wrong value copied | Copy the hex string from your portal URL, not the full URL |
 | `Auth redirected` | Wrong client ID or secret | Regenerate an Application Token in the Ruckus One portal |
 | `No access_token in response` | Token expired or revoked | Regenerate credentials in the Ruckus One portal |
-| `'omada' CLI not found` | CLI not installed or not on PATH | Install [tplink-omada-api](https://github.com/MarkGodwin/tplink-omada-api) and verify `omada` is on your PATH |
-| All devices `[NOT FOUND]` on Omada | Controller unreachable | Verify the `omada` CLI is configured and can reach the controller |
+| All devices `[NOT FOUND]` on Omada | Controller unreachable or wrong site name | Verify `OMADA_URL` is reachable and `OMADA_SITE` matches a site in the controller UI |
+| `Omada login failed (code …)` | Wrong username or password | Check `OMADA_USERNAME` / `OMADA_PASSWORD` in `secrets.conf` |
+| SSL certificate error on Omada | Self-signed controller certificate | Set `OMADA_VERIFY_SSL=false` in `secrets.conf` |
 
 ## Notes
 
@@ -312,5 +319,3 @@ markdownlint-cli2 "*.md"
 ```
 
 Configuration is in `pyproject.toml` and `.markdownlint-cli2.yaml`.
-
-[tplink-omada-api]: https://github.com/MarkGodwin/tplink-omada-api
