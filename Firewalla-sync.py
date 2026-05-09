@@ -36,6 +36,7 @@ import configparser
 import re
 import sys
 import time
+import warnings
 from abc import ABC, abstractmethod
 
 import requests
@@ -66,9 +67,10 @@ PLATFORM_REQUIRED_KEYS: dict[str, list[str]] = {
     ],
 }
 
-_OMADA_REQUEST_TIMEOUT  = 10   # seconds for all Omada HTTP requests
-_OMADA_NOT_FOUND_CODE   = -41011  # Omada error code when the client MAC is unknown
-_RUCKUS_REQUEST_TIMEOUT = 10   # seconds for all Ruckus HTTP requests
+_FIREWALLA_REQUEST_TIMEOUT = 10   # seconds for all Firewalla HTTP requests
+_OMADA_REQUEST_TIMEOUT     = 10   # seconds for all Omada HTTP requests
+_OMADA_NOT_FOUND_CODE      = -41011  # Omada error code when the client MAC is unknown
+_RUCKUS_REQUEST_TIMEOUT    = 10   # seconds for all Ruckus HTTP requests
 
 # Allowlist for RUCKUS_REGION — any other value is rejected at startup.
 _RUCKUS_VALID_REGIONS     = frozenset({'us', 'eu', 'asia'})
@@ -76,7 +78,6 @@ _RUCKUS_VALID_REGIONS     = frozenset({'us', 'eu', 'asia'})
 _RUCKUS_TENANT_ID_PATTERN = re.compile(r'^[0-9a-fA-F]{32}$')
 
 # Process exit codes — used by sys.exit() and SyncError.exit_code.
-EXIT_OK           = 0
 EXIT_CONFIG_ERROR = 1   # missing or invalid configuration
 EXIT_AUTH_ERROR   = 2   # authentication failure
 EXIT_API_ERROR    = 3   # network or API error
@@ -197,7 +198,7 @@ def fetch_firewalla_devices(api_token: str, msp_id: str) -> list[tuple[str, str]
     headers = {'Authorization': f'Token {api_token}'}
     try:
         response = _request_with_retry(
-            lambda: requests.get(url, headers=headers, timeout=10)
+            lambda: requests.get(url, headers=headers, timeout=_FIREWALLA_REQUEST_TIMEOUT)
         )
         response.raise_for_status()
         data = response.json()
@@ -413,12 +414,6 @@ class OmadaPlatform(Platform):
             config.get('OMADA_VERIFY_SSL', 'true').lower().strip() != 'false'
         )
 
-        if not self._verify_ssl:
-            # Suppress the urllib3 InsecureRequestWarning when SSL verification
-            # is intentionally disabled (e.g. self-signed controller certificate).
-            import urllib3  # noqa: PLC0415
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
         # Persistent session for cookie-based auth and HTTP keep-alive
         self._session = requests.Session()
 
@@ -442,10 +437,23 @@ class OmadaPlatform(Platform):
         return f"{base}/{endpoint}"
 
     def _request(self, method: str, url: str, **kwargs) -> dict:
-        """Perform an Omada REST request and return the full parsed JSON body."""
+        """Perform an Omada REST request and return the full parsed JSON body.
+
+        When SSL verification is disabled, the InsecureRequestWarning is
+        suppressed only for this call via a warnings context manager, avoiding
+        the global side-effect of urllib3.disable_warnings().
+        """
         kwargs['verify'] = self._verify_ssl
         kwargs.setdefault('timeout', _OMADA_REQUEST_TIMEOUT)
-        resp = _request_with_retry(lambda: self._session.request(method, url, **kwargs))
+        if not self._verify_ssl:
+            import urllib3  # noqa: PLC0415
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', urllib3.exceptions.InsecureRequestWarning)
+                resp = _request_with_retry(
+                    lambda: self._session.request(method, url, **kwargs)
+                )
+        else:
+            resp = _request_with_retry(lambda: self._session.request(method, url, **kwargs))
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -468,13 +476,21 @@ class OmadaPlatform(Platform):
         # Step 1 — controller info
         try:
             data = self._request('get', f"{self._url}/api/info")
-            self._controller_id = data['result']['omadacId']
-        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+        except (requests.exceptions.RequestException, ValueError) as e:
             print("FAILED", file=sys.stderr)
             raise SyncError(
                 f"  Omada: could not reach controller at {self._url}: {e}",
                 EXIT_AUTH_ERROR,
             ) from e
+        try:
+            self._controller_id = data['result']['omadacId']
+        except KeyError:
+            print("FAILED", file=sys.stderr)
+            raise SyncError(
+                "  Omada: /api/info returned unexpected schema — "
+                f"'result.omadacId' not found. Response: {str(data)[:200]}",
+                EXIT_API_ERROR,
+            )
 
         # Step 2 — login
         try:
@@ -482,22 +498,32 @@ class OmadaPlatform(Platform):
                 'post', self._api_url('login'),
                 json={'username': self._username, 'password': self._password},
             )
-            code = data.get('errorCode', -1)
-            if code != 0:
-                print("FAILED", file=sys.stderr)
-                raise SyncError(
-                    f"  Omada login failed (code {code}): {data.get('msg', '')}",
-                    EXIT_AUTH_ERROR,
-                )
-            self._session.headers.update({
-                'Csrf-Token': data['result']['token'],
-                'Omada-Request-Source': 'web-local',
-                'Referer': self._url + '/',
-                'Origin': self._url,
-            })
-        except (requests.exceptions.RequestException, KeyError, ValueError) as e:
+        except (requests.exceptions.RequestException, ValueError) as e:
             print("FAILED", file=sys.stderr)
             raise SyncError(f"  Omada login request failed: {e}", EXIT_AUTH_ERROR) from e
+
+        code = data.get('errorCode', -1)
+        if code != 0:
+            print("FAILED", file=sys.stderr)
+            raise SyncError(
+                f"  Omada login failed (code {code}): {data.get('msg', '')}",
+                EXIT_AUTH_ERROR,
+            )
+        try:
+            token = data['result']['token']
+        except KeyError:
+            print("FAILED", file=sys.stderr)
+            raise SyncError(
+                "  Omada: login response missing token — unexpected API schema. "
+                f"Response: {str(data)[:200]}",
+                EXIT_API_ERROR,
+            )
+        self._session.headers.update({
+            'Csrf-Token': token,
+            'Omada-Request-Source': 'web-local',
+            'Referer': self._url + '/',
+            'Origin': self._url,
+        })
 
         # Step 3 — resolve site name → site ID
         try:
@@ -936,7 +962,11 @@ def main() -> None:
 
         if args.dry_run:
             print(f"{YELLOW}Dry-run mode — no changes will be made.{RESET}")
-        if args.force_all:
+        if args.force_all and 'ruckus' not in args.platform:
+            print(
+                f"{YELLOW}Warning: --force-all has no effect without --platform ruckus.{RESET}"
+            )
+        elif args.force_all:
             print(f"{YELLOW}Force-all mode — pushing all Firewalla devices to Ruckus One.{RESET}")
 
         for platform in build_platforms(
