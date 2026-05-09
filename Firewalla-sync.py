@@ -815,9 +815,11 @@ def main() -> None:
         if args.dry_run:
             print(f"{YELLOW}Dry-run mode — no changes will be made.{RESET}")
         if args.force_all:
-            print(f"{YELLOW}Force-all mode — all Firewalla devices will be pushed to Ruckus One.{RESET}")
+            print(f"{YELLOW}Force-all mode — pushing all Firewalla devices to Ruckus One.{RESET}")
 
-        for platform in build_platforms(config, args.platform, args.dry_run, args.quiet, args.force_all):
+        for platform in build_platforms(
+            config, args.platform, args.dry_run, args.quiet, args.force_all
+        ):
             platform.sync(devices)
     except SyncError as e:
         print(str(e), file=sys.stderr)
