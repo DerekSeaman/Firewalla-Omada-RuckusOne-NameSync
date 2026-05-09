@@ -245,10 +245,12 @@ class Platform(ABC):
         config: configparser.SectionProxy,
         dry_run: bool = False,
         quiet: bool = False,
+        force_all: bool = False,
     ) -> None:
         self.config = config
         self.dry_run = dry_run
         self.quiet = quiet
+        self.force_all = force_all
 
     @property
     @abstractmethod
@@ -451,8 +453,9 @@ class RuckusPlatform(Platform):
         config: configparser.SectionProxy,
         dry_run: bool = False,
         quiet: bool = False,
+        force_all: bool = False,
     ) -> None:
-        super().__init__(config, dry_run, quiet)
+        super().__init__(config, dry_run, quiet, force_all)
         self._authenticated = False
 
         region = config.get('RUCKUS_REGION', 'us').lower().strip()
@@ -576,7 +579,16 @@ class RuckusPlatform(Platform):
     # ------------------------------------------------------------------
 
     def fetch_known_macs(self) -> set | None:
-        """Return MAC addresses of devices that have connected to a Ruckus AP."""
+        """Return MAC addresses of devices that have connected to a Ruckus AP.
+
+        Returns ``None`` when ``--force-all`` is set, which causes the sync
+        engine to attempt every Firewalla device regardless of whether Ruckus
+        has seen it before.
+        """
+        if self.force_all:
+            print("  Force-all mode — skipping WiFi client filter, syncing all Firewalla devices.")
+            return None
+
         self._authenticate()
         url       = f'{self._api_base}/clients'
         macs: set[str] = set()
@@ -714,9 +726,10 @@ def build_platforms(
     selected: list[str],
     dry_run: bool,
     quiet: bool,
+    force_all: bool,
 ) -> list[Platform]:
     """Instantiate and return the requested platform objects."""
-    return [PLATFORM_REGISTRY[name](config, dry_run, quiet) for name in selected]
+    return [PLATFORM_REGISTRY[name](config, dry_run, quiet, force_all) for name in selected]
 
 
 # ---------------------------------------------------------------------------
@@ -740,6 +753,8 @@ examples:
   python Firewalla-sync.py --dry-run
   python Firewalla-sync.py --platform omada ruckus --dry-run
   python Firewalla-sync.py --quiet
+  python Firewalla-sync.py --platform ruckus --force-all
+  python Firewalla-sync.py --platform ruckus --force-all --dry-run
 
 exit codes:
   0  success
@@ -767,6 +782,15 @@ exit codes:
         action='store_true',
         help='Suppress per-device NOT FOUND output; show only summaries.',
     )
+    parser.add_argument(
+        '--force-all',
+        action='store_true',
+        help=(
+            'Ruckus only: push all Firewalla devices to Ruckus One, '
+            'even if their MAC has never connected to a Ruckus AP. '
+            'By default only known WiFi clients are synced.'
+        ),
+    )
     return parser.parse_args()
 
 
@@ -790,8 +814,10 @@ def main() -> None:
 
         if args.dry_run:
             print(f"{YELLOW}Dry-run mode — no changes will be made.{RESET}")
+        if args.force_all:
+            print(f"{YELLOW}Force-all mode — all Firewalla devices will be pushed to Ruckus One.{RESET}")
 
-        for platform in build_platforms(config, args.platform, args.dry_run, args.quiet):
+        for platform in build_platforms(config, args.platform, args.dry_run, args.quiet, args.force_all):
             platform.sync(devices)
     except SyncError as e:
         print(str(e), file=sys.stderr)
