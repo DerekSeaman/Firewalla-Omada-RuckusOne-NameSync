@@ -16,11 +16,6 @@ On subsequent runs, devices whose name already matches are skipped entirely
 | **TP-Link Omada** | REST API | Local controller access required; firmware 5.1+ |
 | **Ruckus One** | REST API | Cloud-based; reachable from anywhere (see note below) |
 
-> **Ruckus One note:** The Ruckus One APIs support setting and reading client
-> device aliases. However, they are not currently visible in the Ruckus One
-> web UI. It is expected that in April 2026 the web UI will support the
-> display of client device aliases.
-
 The script is designed to make adding new platforms straightforward — see
 [Adding a New Platform](#adding-a-new-platform) below.
 
