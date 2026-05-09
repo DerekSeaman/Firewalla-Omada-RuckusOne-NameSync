@@ -22,7 +22,10 @@ The script is designed to make adding new platforms straightforward — see
 ## Blog Post
 
 For additional information about Firewalla, Ruckus One, Omada, and this script,
-see my blog post: [How to: Firewalla to Ruckus One and Omada Name Sync](https://www.derekseaman.com/2026/05/how-to-firewalla-to-ruckus-one-and-omada-name-sync.html)
+see my blog post:
+
+<!-- markdownlint-disable-next-line MD013 -->
+<a href="https://www.derekseaman.com/2026/05/how-to-firewalla-to-ruckus-one-and-omada-name-sync.html" target="_blank">How to: Firewalla to Ruckus One and Omada Name Sync</a>
 
 ## How It Works
 

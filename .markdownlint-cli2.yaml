@@ -5,4 +5,5 @@ config:
     tables: false
   MD033:
     allowed_elements:
+      - a
       - img
