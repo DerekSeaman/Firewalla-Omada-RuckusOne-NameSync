@@ -36,7 +36,8 @@ The script is designed to make adding new platforms straightforward — see
    - **Ruckus One:** fetches known WiFi client MACs and current aliases
      first, then only pushes names that have changed — devices not
      recognized by Ruckus are reported as "not found" without making
-     an API call
+     an API call. Use `--force-all` to push every Firewalla device
+     regardless of whether Ruckus has seen it before
 
 ## Requirements
 
@@ -114,6 +115,12 @@ python Firewalla-sync.py --platform ruckus --dry-run
 
 # Suppress per-device NOT FOUND lines (show summaries only)
 python Firewalla-sync.py --quiet
+
+# Push all Firewalla devices to Ruckus One, even if unseen by Ruckus (Ruckus only)
+python Firewalla-sync.py --platform ruckus --force-all
+
+# Preview force-all changes without pushing anything
+python Firewalla-sync.py --platform ruckus --force-all --dry-run
 ```
 
 ### Example Output
@@ -226,8 +233,11 @@ step-by-step guide.
 - Alias names are sanitized: spaces become hyphens, characters outside
   `[a-zA-Z0-9_-]` are stripped, consecutive hyphens are collapsed,
   leading/trailing hyphens and underscores are trimmed, max 255 characters
-- Only WiFi clients that have connected to a Ruckus AP are synced —
-  wired-only devices are reported as "not found"
+- By default, only WiFi clients that have connected to a Ruckus AP are synced —
+  wired-only devices and devices Ruckus has never seen are reported as "not found"
+- `--force-all` skips the WiFi client MAC lookup and attempts to push every
+  Firewalla device; skip-if-unchanged still applies, so already-correct aliases
+  are not re-pushed
 - Uses a persistent HTTP session with connection pooling for performance
   across many sequential API calls
 - OAuth2 JWT token is cached for the duration of the run
