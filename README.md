@@ -24,6 +24,11 @@ On subsequent runs, devices whose name already matches are skipped entirely
 The script is designed to make adding new platforms straightforward — see
 [Adding a New Platform](#adding-a-new-platform) below.
 
+## Blog Post
+
+For a full walkthrough including setup and configuration, see the accompanying
+blog post: [How to: Firewalla to Ruckus One and Omada Name Sync](https://www.derekseaman.com/2026/05/how-to-firewalla-to-ruckus-one-and-omada-name-sync.html)
+
 ## How It Works
 
 1. Reads credentials from `secrets.conf`
