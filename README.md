@@ -128,7 +128,7 @@ python Firewalla-sync.py --platform ruckus --force-all --dry-run
 
 ### Example Output
 
-![Sample run output](docs/sample-run.jpg)
+<img src="docs/sample-run.jpg" alt="Sample run output">
 
 ### Summary Fields
 
