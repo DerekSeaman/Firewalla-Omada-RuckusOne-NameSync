@@ -128,26 +128,7 @@ python Firewalla-sync.py --platform ruckus --force-all --dry-run
 
 ### Example Output
 
-```text
-Fetching Firewalla devices... 107 found.
-
---- Omada ---
-Syncing to Omada...
-  [NOT FOUND] 28-80-88-6E-80-3F  M4300-16X
-  [NOT FOUND] 38-94-ED-1D-82-C2  Netgear GS105Ev2
-  Summary — Updated 98/107  |  Unchanged: 0  |  Not found: 9  |  Failed: 0
-
---- Ruckus One ---
-  Authenticating... OK
-  Fetching WiFi clients... 43 found.
-  Fetching existing aliases... 107 found.
-Syncing to Ruckus One...
-  [NOT FOUND] 90:09:D0:89:8E:90  Synology DS923+
-  [NOT FOUND] BC:24:11:77:61:39  Plex Server LXC
-  Summary — Updated 0/107  |  Unchanged: 43  |  Not found: 64  |  Failed: 0
-
-Done.
-```
+![Sample run output](docs/sample-run.jpg)
 
 ### Summary Fields
 
