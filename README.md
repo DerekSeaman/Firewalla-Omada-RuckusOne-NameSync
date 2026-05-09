@@ -26,8 +26,8 @@ The script is designed to make adding new platforms straightforward — see
 
 ## Blog Post
 
-For a full walkthrough including setup and configuration, see the accompanying
-blog post: [How to: Firewalla to Ruckus One and Omada Name Sync](https://www.derekseaman.com/2026/05/how-to-firewalla-to-ruckus-one-and-omada-name-sync.html)
+For additional information about Firewalla, Ruckus One, Omada, and this script,
+see my blog post: [How to: Firewalla to Ruckus One and Omada Name Sync](https://www.derekseaman.com/2026/05/how-to-firewalla-to-ruckus-one-and-omada-name-sync.html)
 
 ## How It Works
 
