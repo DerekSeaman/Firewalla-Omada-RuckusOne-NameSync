@@ -22,9 +22,10 @@ Adding a new platform
     MACs your platform already knows about. Return ``None`` to attempt
     sync for every device; return a set to restrict to those MACs only.
 5.  Override ``fetch_existing_names() -> dict[str, str]`` to enable skip-if-unchanged.
-    Return a dict of lowercase MAC -> current sanitized name.
+    Return a dict of lowercase colon-separated MAC -> current sanitized name
+    (``_normalize_mac`` converts other MAC formats).
 6.  Add required ``secrets.conf`` keys to ``PLATFORM_REQUIRED_KEYS``.
-7.  Register your class in ``build_platforms()``.
+7.  Register your class in ``PLATFORM_REGISTRY``.
 
 See the ``Platform`` docstring for full details.
 """
@@ -33,9 +34,11 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import os
 import re
 import sys
 import time
+import traceback
 import warnings
 from abc import ABC, abstractmethod
 
@@ -48,6 +51,8 @@ import requests
 CONFIG_FILE = 'secrets.conf'
 MAC_PATTERN    = re.compile(r'^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')
 MSP_ID_PATTERN = re.compile(r'^[a-zA-Z0-9-]+$')
+_MAC_SEPARATORS = re.compile(r'[-:.]')
+_MAC_HEX        = re.compile(r'^[0-9a-fA-F]{12}$')
 
 # URL template for the Firewalla MSP device-list endpoint.
 # FIREWALLA_MSP_ID in secrets.conf is substituted at runtime.
@@ -70,7 +75,13 @@ PLATFORM_REQUIRED_KEYS: dict[str, list[str]] = {
 _FIREWALLA_REQUEST_TIMEOUT = 10   # seconds for all Firewalla HTTP requests
 _OMADA_REQUEST_TIMEOUT     = 10   # seconds for all Omada HTTP requests
 _OMADA_NOT_FOUND_CODE      = -41011  # Omada error code when the client MAC is unknown
+_OMADA_PAGE_SIZE           = 100
 _RUCKUS_REQUEST_TIMEOUT    = 10   # seconds for all Ruckus HTTP requests
+_RUCKUS_PAGE_SIZE          = 100
+
+# Upper bound on pages fetched from any paginated endpoint, so an API that
+# ignores the page parameter can't loop forever.
+_MAX_PAGES = 1000
 
 # Allowlist for RUCKUS_REGION — any other value is rejected at startup.
 _RUCKUS_VALID_REGIONS     = frozenset({'us', 'eu', 'asia'})
@@ -78,16 +89,19 @@ _RUCKUS_VALID_REGIONS     = frozenset({'us', 'eu', 'asia'})
 _RUCKUS_TENANT_ID_PATTERN = re.compile(r'^[0-9a-fA-F]{32}$')
 
 # Process exit codes — used by sys.exit() and SyncError.exit_code.
-EXIT_CONFIG_ERROR = 1   # missing or invalid configuration
-EXIT_AUTH_ERROR   = 2   # authentication failure
-EXIT_API_ERROR    = 3   # network or API error
+EXIT_CONFIG_ERROR  = 1   # missing or invalid configuration
+EXIT_AUTH_ERROR    = 2   # authentication failure
+EXIT_API_ERROR     = 3   # network or API error
+EXIT_SYNC_FAILURES = 4   # sync ran, but one or more devices failed to update
+EXIT_UNEXPECTED    = 5   # internal error (bug) — a traceback is printed
 
 # ---------------------------------------------------------------------------
 # ANSI colour codes
 # Automatically disabled when stdout is not a TTY (e.g. piped output, cron)
+# or when the NO_COLOR environment variable is set (https://no-color.org)
 # ---------------------------------------------------------------------------
 
-_USE_COLOUR = sys.stdout.isatty()
+_USE_COLOUR = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
 GREEN  = '\033[1;92m' if _USE_COLOUR else ''
 YELLOW = '\033[1;93m' if _USE_COLOUR else ''
 RED    = '\033[1;91m' if _USE_COLOUR else ''
@@ -130,6 +144,21 @@ def _request_with_retry(request_fn):
         return request_fn()
 
 
+def _normalize_mac(mac: object) -> str:
+    """Return ``mac`` as lowercase colon-separated, or ``''`` if it isn't a MAC.
+
+    Accepts colon-, hyphen- or dot-separated forms and bare hex, so MACs from
+    platform APIs compare equal to the colon-separated Firewalla format.
+    """
+    if not isinstance(mac, str):
+        return ''
+    digits = _MAC_SEPARATORS.sub('', mac)
+    if not _MAC_HEX.match(digits):
+        return ''
+    digits = digits.lower()
+    return ':'.join(digits[i:i + 2] for i in range(0, 12, 2))
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -142,8 +171,10 @@ def load_config() -> configparser.SectionProxy:
     are merged into every other section and accessible via config['DEFAULT'].
     We use it as a flat key-value store, which is the simplest pattern for
     a single-section config file like secrets.conf.
+
+    Interpolation is disabled so secrets containing ``%`` are read literally.
     """
-    config = configparser.ConfigParser()
+    config = configparser.ConfigParser(interpolation=None)
     try:
         if not config.read(CONFIG_FILE):
             print(f"Error: Config file '{CONFIG_FILE}' not found.", file=sys.stderr)
@@ -155,7 +186,25 @@ def load_config() -> configparser.SectionProxy:
               file=sys.stderr)
         print("       The first line of the file must be: [DEFAULT]", file=sys.stderr)
         sys.exit(EXIT_CONFIG_ERROR)
+    except configparser.Error as e:
+        print(f"Error: Could not parse '{CONFIG_FILE}': {e}", file=sys.stderr)
+        sys.exit(EXIT_CONFIG_ERROR)
+
+    _warn_if_config_readable_by_others()
     return config['DEFAULT']
+
+
+def _warn_if_config_readable_by_others() -> None:
+    """Warn (but continue) when secrets.conf is accessible to group or others."""
+    if os.name != 'posix':
+        return
+    try:
+        mode = os.stat(CONFIG_FILE).st_mode
+    except OSError:
+        return
+    if mode & 0o077:
+        print(f"Warning: '{CONFIG_FILE}' is readable by other users. "
+              f"Restrict it with: chmod 600 {CONFIG_FILE}", file=sys.stderr)
 
 
 def validate_config(config: configparser.SectionProxy, platforms: list[str]) -> None:
@@ -182,7 +231,8 @@ def validate_config(config: configparser.SectionProxy, platforms: list[str]) -> 
 def fetch_firewalla_devices(api_token: str, msp_id: str) -> list[tuple[str, str]]:
     """Fetch all devices from the Firewalla cloud API.
 
-    Returns a list of (name, mac) tuples, filtered to valid MAC addresses only.
+    Returns a list of (name, mac) tuples, filtered to valid MAC addresses and
+    non-blank string names (surrounding whitespace is trimmed).
 
     ``msp_id`` is the subdomain portion of your MSP URL, e.g. ``your-msp-id``
     from ``https://your-msp-id.firewalla.net``.  Set it as ``FIREWALLA_MSP_ID``
@@ -223,9 +273,34 @@ def fetch_firewalla_devices(api_token: str, msp_id: str) -> list[tuple[str, str]
         except AttributeError:
             # Skip entries that aren't dicts (e.g. upstream schema drift)
             continue
-        if name and isinstance(mac, str) and MAC_PATTERN.match(mac):
+        if not isinstance(name, str) or not isinstance(mac, str):
+            continue
+        name = name.strip()
+        if name and MAC_PATTERN.match(mac):
             result.append((name, mac))
     return result
+
+
+def drop_duplicate_macs(devices: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Keep the first device for each MAC, warning when duplicates disagree on the name.
+
+    The same MAC can appear more than once when an MSP account has several
+    Firewalla boxes that have each seen the device. Pushing every copy would
+    flip the platform's name back and forth on each run.
+    """
+    first_name: dict[str, str] = {}
+    unique = []
+    for name, mac in devices:
+        key = mac.lower()
+        if key in first_name:
+            if first_name[key] != name:
+                print(f"Warning: {mac} appears more than once in Firewalla "
+                      f"('{first_name[key]}', '{name}'); using '{first_name[key]}'.",
+                      file=sys.stderr)
+            continue
+        first_name[key] = name
+        unique.append((name, mac))
+    return unique
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +314,10 @@ class Platform(ABC):
     Subclass this to add support for a new platform. See the module
     docstring for the step-by-step guide.
     """
+
+    # Set True in a subclass to print each successfully updated device
+    # (suppressed by --quiet).
+    list_updated = False
 
     def __init__(
         self,
@@ -302,8 +381,11 @@ class Platform(ABC):
     # Sync orchestration — not normally overridden
     # ------------------------------------------------------------------
 
-    def sync(self, devices: list[tuple[str, str]]) -> None:
-        """Sync device names to this platform and print a live summary."""
+    def sync(self, devices: list[tuple[str, str]]) -> int:
+        """Sync device names to this platform and print a live summary.
+
+        Returns the number of devices that failed to update.
+        """
         total = len(devices)
         print(f"\n--- {self.platform_name} ---")
 
@@ -344,6 +426,8 @@ class Platform(ABC):
             result = self.set_device_name(mac_lower, sanitized)
             if result == 'updated':
                 updated += 1
+                if self.list_updated and not self.quiet:
+                    print(f"  {GREEN}[UPDATED]  {RESET} {mac}  {sanitized}")
             elif result == 'not_found':
                 not_found += 1
                 if not self.quiet:
@@ -353,6 +437,7 @@ class Platform(ABC):
                 print(f"  {RED}[FAILED]   {RESET} {mac}  {name}")
 
         self._print_summary(total, updated, unchanged, not_found, failed)
+        return failed
 
     def _print_summary(
         self,
@@ -439,6 +524,9 @@ class OmadaPlatform(Platform):
     def _request(self, method: str, url: str, **kwargs) -> dict:
         """Perform an Omada REST request and return the full parsed JSON body.
 
+        Raises ``ValueError`` if the body is not a JSON object, so callers can
+        rely on ``dict`` methods.
+
         When SSL verification is disabled, the InsecureRequestWarning is
         suppressed only for this call via a warnings context manager, avoiding
         the global side-effect of urllib3.disable_warnings().
@@ -454,7 +542,10 @@ class OmadaPlatform(Platform):
                 )
         else:
             resp = _request_with_retry(lambda: self._session.request(method, url, **kwargs))
-        return resp.json()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError(f"expected a JSON object, got {type(data).__name__}")
+        return data
 
     # ------------------------------------------------------------------
     # Authentication (cached after first call)
@@ -477,15 +568,15 @@ class OmadaPlatform(Platform):
         try:
             data = self._request('get', f"{self._url}/api/info")
         except (requests.exceptions.RequestException, ValueError) as e:
-            print("FAILED", file=sys.stderr)
+            print("FAILED")
             raise SyncError(
                 f"  Omada: could not reach controller at {self._url}: {e}",
                 EXIT_AUTH_ERROR,
             ) from e
         try:
             self._controller_id = data['result']['omadacId']
-        except KeyError:
-            print("FAILED", file=sys.stderr)
+        except (KeyError, TypeError):
+            print("FAILED")
             raise SyncError(
                 "  Omada: /api/info returned unexpected schema — "
                 f"'result.omadacId' not found. Response: {str(data)[:200]}",
@@ -499,20 +590,20 @@ class OmadaPlatform(Platform):
                 json={'username': self._username, 'password': self._password},
             )
         except (requests.exceptions.RequestException, ValueError) as e:
-            print("FAILED", file=sys.stderr)
+            print("FAILED")
             raise SyncError(f"  Omada login request failed: {e}", EXIT_AUTH_ERROR) from e
 
         code = data.get('errorCode', -1)
         if code != 0:
-            print("FAILED", file=sys.stderr)
+            print("FAILED")
             raise SyncError(
                 f"  Omada login failed (code {code}): {data.get('msg', '')}",
                 EXIT_AUTH_ERROR,
             )
         try:
             token = data['result']['token']
-        except KeyError:
-            print("FAILED", file=sys.stderr)
+        except (KeyError, TypeError):
+            print("FAILED")
             raise SyncError(
                 "  Omada: login response missing token — unexpected API schema. "
                 f"Response: {str(data)[:200]}",
@@ -528,17 +619,20 @@ class OmadaPlatform(Platform):
         # Step 3 — resolve site name → site ID
         try:
             data = self._request('get', self._api_url('users/current'))
-            sites = data.get('result', {}).get('privilege', {}).get('sites', [])
+            result = data.get('result') or {}
+            sites = (result.get('privilege') or {}).get('sites') or []
+            sites = [s for s in sites if isinstance(s, dict)]
             self._site_id = next(
-                (s['key'] for s in sites if s['name'] == self._site_name), None
+                (s.get('key') for s in sites if s.get('name') == self._site_name), None
             )
-        except (requests.exceptions.RequestException, ValueError) as e:
-            print("FAILED", file=sys.stderr)
+        except (requests.exceptions.RequestException, ValueError,
+                AttributeError, TypeError) as e:
+            print("FAILED")
             raise SyncError(f"  Omada site lookup failed: {e}", EXIT_AUTH_ERROR) from e
 
         if self._site_id is None:
-            print("FAILED", file=sys.stderr)
-            available = ', '.join(s['name'] for s in sites)
+            print("FAILED")
+            available = ', '.join(str(s.get('name')) for s in sites)
             raise SyncError(
                 f"  Omada site '{self._site_name}' not found. "
                 f"Available sites: {available}",
@@ -549,8 +643,50 @@ class OmadaPlatform(Platform):
         print("OK")
 
     # ------------------------------------------------------------------
-    # Platform hook
+    # Platform hooks
     # ------------------------------------------------------------------
+
+    def fetch_existing_names(self) -> dict[str, str]:
+        """Fetch current client names for skip-if-unchanged detection.
+
+        Authenticating here, before any device is processed, also means
+        ``--dry-run`` verifies the controller URL, credentials and site name.
+
+        If the client list can't be read, returns ``{}`` with a warning so
+        every device is pushed (the pre-1.3.0 behaviour) instead of aborting.
+        """
+        self._authenticate()
+        url = self._api_url('insight/clients', site=True)
+        names: dict[str, str] = {}
+
+        print("  Fetching existing client names...", end=' ', flush=True)
+        try:
+            for page in range(1, _MAX_PAGES + 1):
+                data = self._request('get', url, params={
+                    'currentPage': page, 'currentPageSize': _OMADA_PAGE_SIZE,
+                })
+                if data.get('errorCode', -1) != 0:
+                    raise ValueError(f"error {data.get('errorCode')}: {data.get('msg', '')}")
+                result = data.get('result') or {}
+                rows = result.get('data') or []
+                for client in rows:
+                    if not isinstance(client, dict):
+                        continue
+                    mac  = _normalize_mac(client.get('mac'))
+                    name = client.get('name')
+                    if mac and isinstance(name, str):
+                        names[mac] = name
+                if not rows or page * _OMADA_PAGE_SIZE >= int(result.get('totalRows', 0)):
+                    break
+        except (requests.exceptions.RequestException, ValueError,
+                AttributeError, TypeError) as e:
+            print("skipped")
+            print(f"  Warning: could not read Omada client names ({e}); "
+                  f"pushing every device.", file=sys.stderr)
+            return {}
+
+        print(f"{len(names)} found.")
+        return names
 
     def set_device_name(self, mac: str, name: str) -> str:
         """PATCH the client alias via the Omada REST API."""
@@ -569,7 +705,7 @@ class OmadaPlatform(Platform):
                 file=sys.stderr,
             )
             return 'failed'
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, ValueError) as e:
             print(f"  Warning: Omada request failed for {mac}: {e}", file=sys.stderr)
             return 'failed'
 
@@ -596,6 +732,8 @@ class RuckusPlatform(Platform):
     Administration → Account Management → Settings → Application Tokens
     """
 
+    list_updated = True
+
     def __init__(
         self,
         config: configparser.SectionProxy,
@@ -605,6 +743,7 @@ class RuckusPlatform(Platform):
     ) -> None:
         super().__init__(config, dry_run, quiet, force_all)
         self._authenticated = False
+        self._reauthenticated = False
 
         region = config.get('RUCKUS_REGION', 'us').lower().strip()
         if region not in _RUCKUS_VALID_REGIONS:
@@ -640,7 +779,7 @@ class RuckusPlatform(Platform):
     # Authentication (token is cached after first call)
     # ------------------------------------------------------------------
 
-    def _authenticate(self) -> None:
+    def _authenticate(self, label: str = 'Authenticating...') -> None:
         """Obtain and cache a JWT access token via OAuth2 client credentials.
 
         The token is stored on ``self._session`` so all subsequent requests
@@ -649,7 +788,9 @@ class RuckusPlatform(Platform):
         if self._authenticated:
             return
 
-        print("  Authenticating...", end=' ', flush=True)
+        print(f"  {label}", end=' ', flush=True)
+        # Don't send an old (possibly expired) bearer token to the token endpoint
+        self._session.headers.pop('Authorization', None)
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded',
             'Accept': 'application/json',
@@ -668,11 +809,11 @@ class RuckusPlatform(Platform):
                 )
             )
         except (requests.exceptions.RequestException, ValueError) as e:
-            print("FAILED", file=sys.stderr)
+            print("FAILED")
             raise SyncError(f"  Authentication request failed: {e}", EXIT_AUTH_ERROR) from e
 
         if response.status_code in (301, 302, 303, 307, 308):
-            print("FAILED", file=sys.stderr)
+            print("FAILED")
             raise SyncError(
                 "  Auth redirected — check client_id/client_secret.\n"
                 "  Check: Administration → Account Management → "
@@ -683,12 +824,12 @@ class RuckusPlatform(Platform):
         try:
             response.raise_for_status()
             token = response.json().get('access_token')
-        except (requests.exceptions.HTTPError, ValueError) as e:
-            print("FAILED", file=sys.stderr)
+        except (requests.exceptions.HTTPError, ValueError, AttributeError) as e:
+            print("FAILED")
             raise SyncError(f"  {e}", EXIT_AUTH_ERROR) from e
 
         if not token:
-            print("FAILED", file=sys.stderr)
+            print("FAILED")
             # Truncate to avoid leaking sensitive fields the server may return
             body_preview = response.text.strip()[:200]
             raise SyncError(
@@ -699,6 +840,23 @@ class RuckusPlatform(Platform):
         print("OK")
         self._session.headers.update({'Authorization': f'Bearer {token}'})
         self._authenticated = True
+
+    def _send(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Send an authenticated API request and return the response.
+
+        If the token expires mid-run (HTTP 401), re-authenticates and repeats
+        the request — once per run, so a 401 caused by missing permissions
+        doesn't trigger a token request for every device.
+        """
+        self._authenticate()
+        kwargs.setdefault('timeout', _RUCKUS_REQUEST_TIMEOUT)
+        response = _request_with_retry(lambda: self._session.request(method, url, **kwargs))
+        if response.status_code == 401 and not self._reauthenticated:
+            self._reauthenticated = True
+            self._authenticated = False
+            self._authenticate('Token rejected — re-authenticating...')
+            response = _request_with_retry(lambda: self._session.request(method, url, **kwargs))
+        return response
 
     # ------------------------------------------------------------------
     # Name sanitization
@@ -719,8 +877,8 @@ class RuckusPlatform(Platform):
         alias = name.replace(' ', '-')
         alias = _RUCKUS_ALIAS_INVALID.sub('', alias)
         alias = _RUCKUS_MULTI_HYPHEN.sub('-', alias)
-        alias = alias.strip('-_')
-        return alias[:255]
+        # Strip again after truncating so the alias can't end in '-' or '_'
+        return alias.strip('-_')[:255].rstrip('-_')
 
     # ------------------------------------------------------------------
     # Platform hooks
@@ -738,44 +896,43 @@ class RuckusPlatform(Platform):
             return None
 
         self._authenticate()
-        url       = f'{self._api_base}/clients'
+        url = f'{self._api_base}/clients'
         macs: set[str] = set()
-        page      = 0
-        page_size = 100
 
         print("  Fetching WiFi clients...", end=' ', flush=True)
-        while True:
+        for page in range(_MAX_PAGES):
             try:
-                response = _request_with_retry(
-                    lambda: self._session.get(
-                        url, params={'page': page, 'size': page_size},
-                        timeout=_RUCKUS_REQUEST_TIMEOUT,
-                    )
+                response = self._send(
+                    'get', url, params={'page': page, 'size': _RUCKUS_PAGE_SIZE},
                 )
                 response.raise_for_status()
                 data = response.json()
             except (requests.exceptions.RequestException, ValueError) as e:
-                print("FAILED", file=sys.stderr)
+                print("FAILED")
                 raise SyncError(f"  {e}", EXIT_API_ERROR) from e
 
             if not isinstance(data, list):
-                print("FAILED", file=sys.stderr)
+                print("FAILED")
                 raise SyncError(
                     f"  /clients returned {type(data).__name__} instead of a list.",
                     EXIT_API_ERROR,
                 )
 
+            known_before = len(macs)
             for client in data:
-                try:
-                    mac = client.get('mac', '')
-                except AttributeError:
-                    continue
-                if isinstance(mac, str) and mac:
-                    macs.add(mac.lower())
+                if isinstance(client, dict):
+                    mac = _normalize_mac(client.get('mac'))
+                    if mac:
+                        macs.add(mac)
 
-            if len(data) < page_size:
+            # Stop on an empty page, or one that adds nothing new (the API
+            # ignoring `page`). A short page is not the end: the API may cap
+            # `size` below what was requested.
+            if not data or len(macs) == known_before:
                 break
-            page += 1
+        else:
+            print(f"\n  Warning: stopped after {_MAX_PAGES} pages of WiFi clients.",
+                  file=sys.stderr)
 
         print(f"{len(macs)} found.")
         return macs
@@ -783,69 +940,62 @@ class RuckusPlatform(Platform):
     def fetch_existing_names(self) -> dict[str, str]:
         """Fetch all current client aliases for skip-if-unchanged detection."""
         self._authenticate()
-        url     = f'{self._api_base}/clients/aliases/query'
+        url = f'{self._api_base}/clients/aliases/query'
         aliases: dict[str, str] = {}
-        page      = 0
-        page_size = 100
 
         print("  Fetching existing aliases...", end=' ', flush=True)
-        while True:
+        for page in range(_MAX_PAGES):
             try:
-                response = _request_with_retry(
-                    lambda: self._session.post(
-                        url, json={},
-                        headers={'Content-Type': 'application/json'},
-                        params={'page': page, 'size': page_size},
-                        timeout=_RUCKUS_REQUEST_TIMEOUT,
-                    )
+                response = self._send(
+                    'post', url, json={},
+                    headers={'Content-Type': 'application/json'},
+                    params={'page': page, 'size': _RUCKUS_PAGE_SIZE},
                 )
                 response.raise_for_status()
                 data = response.json()
             except (requests.exceptions.RequestException, ValueError) as e:
-                print("FAILED", file=sys.stderr)
+                print("FAILED")
                 raise SyncError(f"  {e}", EXIT_API_ERROR) from e
 
             if not isinstance(data, dict):
-                print("FAILED", file=sys.stderr)
+                print("FAILED")
                 raise SyncError(
                     f"  /clients/aliases/query returned "
                     f"{type(data).__name__} instead of a dict.",
                     EXIT_API_ERROR,
                 )
 
-            for client in data.get('content', []):
-                try:
-                    mac   = client.get('macAddress', '')
-                    alias = client.get('alias', '')
-                except AttributeError:
+            for client in data.get('content') or []:
+                if not isinstance(client, dict):
                     continue
-                if isinstance(mac, str) and mac:
-                    aliases[mac.lower()] = alias if isinstance(alias, str) else ''
+                mac   = _normalize_mac(client.get('macAddress'))
+                alias = client.get('alias')
+                if mac:
+                    aliases[mac] = alias if isinstance(alias, str) else ''
 
             if data.get('last', True):
                 break
-            page += 1
+        else:
+            print(f"\n  Warning: stopped after {_MAX_PAGES} pages of aliases.",
+                  file=sys.stderr)
 
         print(f"{len(aliases)} found.")
         return aliases
 
     def set_device_name(self, mac: str, name: str) -> str:
         """Set a client alias in Ruckus One. ``name`` is already sanitized."""
-        self._authenticate()
         url     = f'{self._api_base}/clients/aliases/{mac}'
         # deviceType must be 'WIFI' — Ruckus One aliases are WiFi-only;
         # wired clients are not manageable via this endpoint.
         payload = {'alias': name, 'macAddress': mac, 'deviceType': 'WIFI'}
 
         try:
-            response = _request_with_retry(
-                lambda: self._session.put(
-                    url, json=payload,
-                    headers={'Content-Type': 'application/json'},
-                    timeout=_RUCKUS_REQUEST_TIMEOUT,
-                )
+            response = self._send(
+                'put', url, json=payload,
+                headers={'Content-Type': 'application/json'},
             )
-            if response.status_code == 202:
+            # The API normally answers 202 Accepted; treat any 2xx as success
+            if 200 <= response.status_code < 300:
                 return 'updated'
             if response.status_code == 404:
                 return 'not_found'
@@ -867,17 +1017,6 @@ PLATFORM_REGISTRY: dict[str, type[Platform]] = {
     'omada':  OmadaPlatform,
     'ruckus': RuckusPlatform,
 }
-
-
-def build_platforms(
-    config: configparser.SectionProxy,
-    selected: list[str],
-    dry_run: bool,
-    quiet: bool,
-    force_all: bool,
-) -> list[Platform]:
-    """Instantiate and return the requested platform objects."""
-    return [PLATFORM_REGISTRY[name](config, dry_run, quiet, force_all) for name in selected]
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +1048,8 @@ exit codes:
   1  configuration error (missing or invalid config)
   2  authentication failure
   3  network or API error
+  4  sync ran, but one or more devices failed to update
+  5  unexpected internal error (a traceback is printed)
 """,
     )
     parser.add_argument(
@@ -928,7 +1069,8 @@ exit codes:
     parser.add_argument(
         '--quiet',
         action='store_true',
-        help='Suppress per-device NOT FOUND output; show only summaries.',
+        help='Suppress per-device NOT FOUND and UPDATED output; show only '
+             'summaries and failures.',
     )
     parser.add_argument(
         '--force-all',
@@ -947,39 +1089,72 @@ exit codes:
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    args = parse_args()
-    config = load_config()
-    validate_config(config, args.platform)
+def run_platform(name: str, config: configparser.SectionProxy,
+                 args: argparse.Namespace, devices: list[tuple[str, str]]) -> int:
+    """Build and sync one platform; return its exit code (0 on full success).
 
+    Errors are reported here rather than raised, so one platform failing
+    doesn't stop the others from syncing.
+    """
     try:
-        print("Fetching Firewalla devices...", end=' ', flush=True)
+        platform = PLATFORM_REGISTRY[name](config, args.dry_run, args.quiet, args.force_all)
+        failed = platform.sync(devices)
+    except SyncError as e:
+        print(str(e), file=sys.stderr)
+        return e.exit_code
+    except Exception:
+        print(f"Error: unexpected failure while syncing '{name}':", file=sys.stderr)
+        traceback.print_exc()
+        return EXIT_UNEXPECTED
+    return EXIT_SYNC_FAILURES if failed else 0
+
+
+def main() -> None:
+    # Keep stdout and stderr lines in order when both go to one log (cron's 2>&1)
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(line_buffering=True)
+    args = parse_args()
+    platforms = list(dict.fromkeys(args.platform))  # drop repeats, keep order
+    config = load_config()
+    validate_config(config, platforms)
+
+    print("Fetching Firewalla devices...", end=' ', flush=True)
+    try:
         devices = fetch_firewalla_devices(
             config['FIREWALLA_API_TOKEN'],
             config['FIREWALLA_MSP_ID'],
         )
-        print(f"{len(devices)} found.")
-
-        if args.dry_run:
-            print(f"{YELLOW}Dry-run mode — no changes will be made.{RESET}")
-        if args.force_all and 'ruckus' not in args.platform:
-            print(
-                f"{YELLOW}Warning: --force-all has no effect without --platform ruckus.{RESET}"
-            )
-        elif args.force_all:
-            print(f"{YELLOW}Force-all mode — pushing all Firewalla devices to Ruckus One.{RESET}")
-
-        for platform in build_platforms(
-            config, args.platform, args.dry_run, args.quiet, args.force_all
-        ):
-            platform.sync(devices)
     except SyncError as e:
+        print("FAILED")
         print(str(e), file=sys.stderr)
         sys.exit(e.exit_code)
-    except Exception as e:
-        print(f"Error: unexpected failure: {e}", file=sys.stderr)
-        sys.exit(EXIT_API_ERROR)
+    except Exception:
+        print("FAILED")
+        traceback.print_exc()
+        sys.exit(EXIT_UNEXPECTED)
+    print(f"{len(devices)} found.")
+    devices = drop_duplicate_macs(devices)
 
+    if args.dry_run:
+        print(f"{YELLOW}Dry-run mode — no changes will be made.{RESET}")
+    if args.force_all and 'ruckus' not in platforms:
+        print(
+            f"{YELLOW}Warning: --force-all has no effect without --platform ruckus.{RESET}"
+        )
+    elif args.force_all:
+        print(f"{YELLOW}Force-all mode — pushing all Firewalla devices to Ruckus One.{RESET}")
+
+    # A platform-level error (config, auth, API, bug) outranks per-device
+    # failures in the exit code; otherwise the first error wins.
+    exit_code = 0
+    for name in platforms:
+        code = run_platform(name, config, args, devices)
+        if code and exit_code in (0, EXIT_SYNC_FAILURES):
+            exit_code = code
+
+    if exit_code:
+        print(f"\nDone with errors (exit code {exit_code}).")
+        sys.exit(exit_code)
     print("\nDone.")
 
 

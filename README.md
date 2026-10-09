@@ -7,7 +7,8 @@ the device's MAC address as the lookup key.
 
 Devices without a name or with an invalid MAC address are automatically skipped.
 On subsequent runs, devices whose name already matches are skipped entirely
-(no unnecessary API calls).
+(no unnecessary API calls). Each platform syncs independently, so a problem
+with one (e.g. an unreachable Omada controller) doesn't stop the others.
 
 ## Supported Platforms
 
@@ -31,11 +32,13 @@ see my blog post:
 
 1. Reads credentials from `secrets.conf`
 2. Fetches the full device list from the Firewalla MSP API
-3. Filters out entries with invalid/missing MAC addresses or empty names
+3. Filters out entries with invalid/missing MAC addresses or empty names, and
+   keeps only the first entry when a MAC appears more than once (e.g. seen by
+   several Firewalla boxes); conflicting names are reported as a warning
 4. For each selected platform:
    - Pushes updated names and prints a per-platform summary
-   - **Omada:** authenticates directly to the controller REST API and
-     pushes all device names on every run
+   - **Omada:** authenticates directly to the controller REST API, reads the
+     current client names, then only pushes names that have changed
    - **Ruckus One:** fetches known WiFi client MACs and current aliases
      first, then only pushes names that have changed — devices not
      recognized by Ruckus are reported as "not found" without making
@@ -119,7 +122,7 @@ python Firewalla-sync.py --platform omada ruckus
 python Firewalla-sync.py --dry-run
 python Firewalla-sync.py --platform ruckus --dry-run
 
-# Suppress per-device NOT FOUND lines (show summaries only)
+# Suppress per-device NOT FOUND and UPDATED lines (show summaries and failures only)
 python Firewalla-sync.py --quiet
 
 # Push all Firewalla devices to Ruckus One, even if unseen by Ruckus (Ruckus only)
@@ -212,7 +215,10 @@ step-by-step guide.
 - MACs are converted from colon-separated (`aa:bb:cc:dd:ee:ff`) to
   hyphen-separated (`aa-bb-cc-dd-ee-ff`) as required by the Omada API
 - Leading hyphens are stripped from device names (the Omada API treats them as invalid)
-- No unchanged detection — every run pushes all device names to the controller
+- Current client names are read first and unchanged names are skipped. If the
+  client list can't be read, a warning is printed and every name is pushed
+- `--dry-run` logs in to the controller, so it also verifies `OMADA_URL`,
+  credentials and `OMADA_SITE`
 - All HTTP requests have a 10-second timeout with one automatic retry on
   transient connection errors
 - Set `OMADA_VERIFY_SSL=false` when the controller uses a self-signed TLS certificate
@@ -228,9 +234,15 @@ step-by-step guide.
 - `--force-all` skips the WiFi client MAC lookup and attempts to push every
   Firewalla device; skip-if-unchanged still applies, so already-correct aliases
   are not re-pushed
+- Each alias that is updated is listed in green as `[UPDATED]` with its MAC and
+  the new alias, alongside the yellow `[NOT FOUND]` lines (Omada output is
+  unchanged). `--quiet` hides both
+- MACs returned by Ruckus are normalized (case and `-`, `:` or `.` separators)
+  before comparing with Firewalla
 - Uses a persistent HTTP session with connection pooling for performance
   across many sequential API calls
-- OAuth2 JWT token is cached for the duration of the run
+- OAuth2 JWT token is cached for the duration of the run; if it's rejected
+  mid-run (HTTP 401), the script re-authenticates once and retries
 - `RUCKUS_REGION` must be exactly `us`, `eu`, or `asia` — any other value
   is rejected at startup with a clear error message
 - `RUCKUS_TENANT_ID` must be a 32-character hexadecimal string — validated
@@ -248,9 +260,10 @@ crontab -e
 0 * * * * cd /path/to/firewalla-mac-sync && python Firewalla-sync.py --quiet >> /var/log/firewalla-sync.log 2>&1
 ```
 
-`--quiet` suppresses the per-device NOT FOUND lines that would otherwise
-fill the log on every run. Normal output goes to stdout; error messages
-go to stderr — both are captured by `2>&1`.
+`--quiet` suppresses the per-device NOT FOUND and UPDATED lines that would
+otherwise fill the log on every run; failures are still listed. Normal output
+goes to stdout; error messages go to stderr — both are captured, in order, by
+`2>&1`. A non-zero [exit code](#exit-codes) means something needs attention.
 
 ## Troubleshooting
 
@@ -266,20 +279,26 @@ go to stderr — both are captured by `2>&1`.
 | All devices `[NOT FOUND]` on Omada | Controller unreachable or wrong site name | Verify `OMADA_URL` is reachable and `OMADA_SITE` matches a site in the controller UI |
 | `Omada login failed (code …)` | Wrong username or password | Check `OMADA_USERNAME` / `OMADA_PASSWORD` in `secrets.conf` |
 | SSL certificate error on Omada | Self-signed controller certificate | Set `OMADA_VERIFY_SSL=false` in `secrets.conf` |
+| `could not read Omada client names` | Controller API didn't return the client list | Sync still runs but pushes every name; check controller firmware is 5.1+ |
+| `'secrets.conf' is readable by other users` | File permissions too open | `chmod 600 secrets.conf` |
+| `… appears more than once in Firewalla` | Same MAC seen by several Firewalla boxes with different names | Rename the device consistently in Firewalla; the first name is used |
+| `Done with errors (exit code 4)` | Some devices failed to update | See the `[FAILED]` lines and warnings above it |
 
 ## Notes
 
 - ANSI color output is automatically disabled when stdout is not a TTY
-  (e.g. piped to a file, running in cron)
+  (e.g. piped to a file, running in cron) or when `NO_COLOR` is set
 - Error messages are written to stderr; normal progress output goes to stdout
+- `secrets.conf` values are read literally (a `%` in a password is fine), and
+  a warning is printed if the file is readable by other users
 - The Firewalla MSP ID is validated to contain only letters, numbers, and
   hyphens before being used in URL construction
 - Devices without a name in Firewalla are silently skipped (no empty names
   are pushed)
 - All HTTP requests have a 10-second timeout with one automatic retry on
   transient connection errors
-- The script exits immediately on authentication or API errors with a
-  descriptive message
+- An authentication or API error stops only the affected platform; the
+  remaining platforms still sync, and the exit code reports the error
 
 ### Exit codes
 
@@ -289,6 +308,11 @@ go to stderr — both are captured by `2>&1`.
 | `1` | Configuration error (missing or invalid config value) |
 | `2` | Authentication failure |
 | `3` | Network or API error |
+| `4` | Sync ran, but one or more devices failed to update |
+| `5` | Unexpected internal error (a traceback is printed) |
+
+When several platforms have problems, a configuration, authentication, API or
+internal error takes precedence over `4`; otherwise the first error is reported.
 
 ## Linting
 
