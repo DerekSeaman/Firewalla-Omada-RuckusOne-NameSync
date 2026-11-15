@@ -315,10 +315,6 @@ class Platform(ABC):
     docstring for the step-by-step guide.
     """
 
-    # Set True in a subclass to print each successfully updated device
-    # (suppressed by --quiet).
-    list_updated = False
-
     def __init__(
         self,
         config: configparser.SectionProxy,
@@ -426,7 +422,7 @@ class Platform(ABC):
             result = self.set_device_name(mac_lower, sanitized)
             if result == 'updated':
                 updated += 1
-                if self.list_updated and not self.quiet:
+                if not self.quiet:
                     print(f"  {GREEN}[UPDATED]  {RESET} {mac}  {sanitized}")
             elif result == 'not_found':
                 not_found += 1
@@ -731,8 +727,6 @@ class RuckusPlatform(Platform):
     Create an Application Token in Ruckus One under:
     Administration → Account Management → Settings → Application Tokens
     """
-
-    list_updated = True
 
     def __init__(
         self,

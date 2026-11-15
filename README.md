@@ -145,6 +145,10 @@ python Firewalla-sync.py --platform ruckus --force-all --dry-run
 | **Not found** | Device exists in Firewalla but is unknown to this platform (e.g. a wired-only device on a WiFi-only controller) |
 | **Failed** | Push was attempted but the platform returned an error |
 
+On every platform, each updated device is listed in green as `[UPDATED]` with its
+MAC and the name that was pushed, alongside the yellow `[NOT FOUND]` lines.
+`--quiet` hides both.
+
 ## Adding a New Platform
 
 The script uses a `Platform` abstract base class so new integrations can be
@@ -234,9 +238,6 @@ step-by-step guide.
 - `--force-all` skips the WiFi client MAC lookup and attempts to push every
   Firewalla device; skip-if-unchanged still applies, so already-correct aliases
   are not re-pushed
-- Each alias that is updated is listed in green as `[UPDATED]` with its MAC and
-  the new alias, alongside the yellow `[NOT FOUND]` lines (Omada output is
-  unchanged). `--quiet` hides both
 - MACs returned by Ruckus are normalized (case and `-`, `:` or `.` separators)
   before comparing with Firewalla
 - Uses a persistent HTTP session with connection pooling for performance

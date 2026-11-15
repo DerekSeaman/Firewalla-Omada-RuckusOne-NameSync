@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Omada: list each updated client (`[UPDATED]` in green, with MAC and name),
+  as Ruckus One does. `--quiet` hides these lines.
+
 ## 1.3.0
 
 ### Added
