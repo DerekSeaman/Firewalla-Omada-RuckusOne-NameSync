@@ -99,7 +99,7 @@ RUCKUS_REGION=us
 | `OMADA_USERNAME` | An Omada admin account username |
 | `OMADA_PASSWORD` | Password for the Omada admin account |
 | `OMADA_SITE` | The site name as shown in the Omada controller UI (default: `Default`) |
-| `OMADA_VERIFY_SSL` | Set to `false` only if your controller uses a self-signed certificate |
+| `OMADA_VERIFY_SSL` | Set to `false` only if your controller uses a self-signed certificate. `true`/`false` (also `yes`/`no`, `1`/`0`, `on`/`off`); any other value is a configuration error |
 | `RUCKUS_CLIENT_ID` | Ruckus One portal → Administration → Account Management → Settings → Application Tokens |
 | `RUCKUS_CLIENT_SECRET` | Same location as Client ID |
 | `RUCKUS_TENANT_ID` | The 32-character hex string in the Ruckus One portal URL: `https://ruckus.cloud/{tenant_id}/t/dashboard` |
@@ -122,7 +122,7 @@ python Firewalla-sync.py --platform omada ruckus
 python Firewalla-sync.py --dry-run
 python Firewalla-sync.py --platform ruckus --dry-run
 
-# Suppress per-device NOT FOUND and UPDATED lines (show summaries and failures only)
+# Suppress per-device NOT FOUND, SKIPPED and UPDATED lines (show summaries and failures only)
 python Firewalla-sync.py --quiet
 
 # Push all Firewalla devices to Ruckus One, even if unseen by Ruckus (Ruckus only)
@@ -143,11 +143,13 @@ python Firewalla-sync.py --platform ruckus --force-all --dry-run
 | **Updated** | Name was successfully pushed to the platform |
 | **Unchanged** | Name already matched — no API call was made |
 | **Not found** | Device exists in Firewalla but is unknown to this platform (e.g. a wired-only device on a WiFi-only controller) |
+| **Skipped** | Nothing in the name is valid on this platform (e.g. an emoji-only name on Ruckus One). Shown only when it happens; it is not a failure and does not change the exit code |
 | **Failed** | Push was attempted but the platform returned an error |
+| **Not attempted** | Devices left untouched because the platform stopped answering (see below). Shown only when it happens |
 
 On every platform, each updated device is listed in green as `[UPDATED]` with its
-MAC and the name that was pushed, alongside the yellow `[NOT FOUND]` lines.
-`--quiet` hides both.
+MAC and the name that was pushed, alongside the yellow `[NOT FOUND]` and
+`[SKIPPED]` lines. `--quiet` hides all three.
 
 ## Adding a New Platform
 
@@ -168,7 +170,7 @@ class UniFiPlatform(Platform):
     def set_device_name(self, mac: str, name: str) -> str:
         # mac is lowercase colon-separated, name is already sanitized
         ...
-        return 'updated'   # or 'not_found' or 'failed'
+        return 'updated'   # or 'not_found', 'failed', or 'unreachable' (no answer)
 ```
 
 ### 2. Register it
@@ -203,7 +205,7 @@ dry-run support, and summary output are all handled automatically.
 | --- | --- | --- |
 | `sanitize_name(name)` | Returns name unchanged | The platform has naming restrictions (e.g. no spaces, max length) |
 | `fetch_known_macs()` | `None` (sync all) | You want to limit syncing to MACs the platform already knows about |
-| `fetch_existing_names()` | `{}` (always push) | The platform's API lets you read current names for skip-if-unchanged |
+| `fetch_existing_names()` | `{}` (always push) | The platform's API lets you read current names for skip-if-unchanged. Return `None` if the names can't be read |
 
 See the module docstring at the top of `Firewalla-sync.py` for the full
 step-by-step guide.
@@ -218,21 +220,28 @@ step-by-step guide.
   resolve site name to site ID. The session is cached for the duration of the run
 - MACs are converted from colon-separated (`aa:bb:cc:dd:ee:ff`) to
   hyphen-separated (`aa-bb-cc-dd-ee-ff`) as required by the Omada API
-- Leading hyphens are stripped from device names (the Omada API treats them as invalid)
+- Leading hyphens are stripped from device names (the Omada API treats them as
+  invalid), along with any space that follows them (`- Kitchen` → `Kitchen`)
 - Current client names are read first and unchanged names are skipped. If the
   client list can't be read, a warning is printed and every name is pushed
 - `--dry-run` logs in to the controller, so it also verifies `OMADA_URL`,
-  credentials and `OMADA_SITE`
+  credentials and `OMADA_SITE`. Devices missing from the controller's client
+  list are previewed as `[NOT FOUND]`, as a real run would report them
 - All HTTP requests have a 10-second timeout with one automatic retry on
   transient connection errors
+- The script logs out of the controller when it finishes, and logs in again
+  once if the controller ends the session mid-run
 - Set `OMADA_VERIFY_SSL=false` when the controller uses a self-signed TLS certificate
   (common for software controllers on a LAN); doing so suppresses urllib3 warnings
 
 ### Ruckus One
 
-- Alias names are sanitized: spaces become hyphens, characters outside
-  `[a-zA-Z0-9_-]` are stripped, consecutive hyphens are collapsed,
-  leading/trailing hyphens and underscores are trimmed, max 255 characters
+- Alias names are sanitized: accented letters lose their accent (`ü` → `u`),
+  spaces and tabs become hyphens, characters outside `[a-zA-Z0-9_-]` are
+  stripped, consecutive hyphens are collapsed, leading/trailing hyphens and
+  underscores are trimmed, max 255 characters
+- A name with nothing left after sanitizing (an emoji, or a name written
+  entirely in a non-Latin script) is listed as `[SKIPPED]` and not synced
 - By default, only WiFi clients that have connected to a Ruckus AP are synced —
   wired-only devices and devices Ruckus has never seen are reported as "not found"
 - `--force-all` skips the WiFi client MAC lookup and attempts to push every
@@ -261,7 +270,7 @@ crontab -e
 0 * * * * cd /path/to/firewalla-mac-sync && python Firewalla-sync.py --quiet >> /var/log/firewalla-sync.log 2>&1
 ```
 
-`--quiet` suppresses the per-device NOT FOUND and UPDATED lines that would
+`--quiet` suppresses the per-device NOT FOUND, SKIPPED and UPDATED lines that would
 otherwise fill the log on every run; failures are still listed. Normal output
 goes to stdout; error messages go to stderr — both are captured, in order, by
 `2>&1`. A non-zero [exit code](#exit-codes) means something needs attention.
@@ -277,13 +286,21 @@ goes to stdout; error messages go to stderr — both are captured, in order, by
 | `RUCKUS_TENANT_ID must be a 32-character hex string` | Wrong value copied | Copy the hex string from your portal URL, not the full URL |
 | `Auth redirected` | Wrong client ID or secret | Regenerate an Application Token in the Ruckus One portal |
 | `No access_token in response` | Token expired or revoked | Regenerate credentials in the Ruckus One portal |
+| `Ruckus One rejected the application token` | Wrong client ID, secret or tenant ID | Check the three `RUCKUS_*` values, or regenerate the Application Token |
+| `Ruckus One still rejects the token after signing in again` | The token is valid but lacks permission | Check the Application Token's role in the Ruckus One portal |
+| `Firewalla rejected the API token` | Wrong or revoked token | Check `FIREWALLA_API_TOKEN` in `secrets.conf` |
+| `Omada: … answered …, but not as an Omada controller` | `OMADA_URL` points at a different web server or the wrong port | Check `OMADA_URL`, including the port (usually `8043`) |
+| `stopped after 3 connection failures in a row` | The platform went offline during the run | Nothing is lost; the next run syncs the devices that were not attempted |
 | All devices `[NOT FOUND]` on Omada | Controller unreachable or wrong site name | Verify `OMADA_URL` is reachable and `OMADA_SITE` matches a site in the controller UI |
 | `Omada login failed (code …)` | Wrong username or password | Check `OMADA_USERNAME` / `OMADA_PASSWORD` in `secrets.conf` |
-| SSL certificate error on Omada | Self-signed controller certificate | Set `OMADA_VERIFY_SSL=false` in `secrets.conf` |
+| `TLS certificate verification failed` on Omada | Self-signed controller certificate | Set `OMADA_VERIFY_SSL=false` in `secrets.conf` |
 | `could not read Omada client names` | Controller API didn't return the client list | Sync still runs but pushes every name; check controller firmware is 5.1+ |
 | `'secrets.conf' is readable by other users` | File permissions too open | `chmod 600 secrets.conf` |
 | `… appears more than once in Firewalla` | Same MAC seen by several Firewalla boxes with different names | Rename the device consistently in Firewalla; the first name is used |
 | `Done with errors (exit code 4)` | Some devices failed to update | See the `[FAILED]` lines and warnings above it |
+| `/clients returned N clients, but none had a readable 'mac' field` | Ruckus One changed its client list format | Nothing was synced to Ruckus One; the script needs updating for the new format |
+| `'secrets.conf' is not valid UTF-8 text` | The file was saved in another encoding | Re-save `secrets.conf` as UTF-8 |
+| `Firewalla returned no devices …` (exit code 3) | The Firewalla API answered with an empty device list | Check `FIREWALLA_API_TOKEN` and `FIREWALLA_MSP_ID`, and that the MSP account has boxes online |
 
 ## Notes
 
@@ -294,10 +311,24 @@ goes to stdout; error messages go to stderr — both are captured, in order, by
   a warning is printed if the file is readable by other users
 - The Firewalla MSP ID is validated to contain only letters, numbers, and
   hyphens before being used in URL construction
+- Line breaks, tabs and other control characters inside a Firewalla device
+  name are replaced by a single space before the name is used
+- `secrets.conf` is read as UTF-8, whatever the system locale
+- Output that the terminal or log encoding can't represent (e.g. an emoji in
+  a device name under a non-UTF-8 locale) is written as an escape such as
+  `\U0001f4fa` instead of stopping the run
 - Devices without a name in Firewalla are silently skipped (no empty names
   are pushed)
 - All HTTP requests have a 10-second timeout with one automatic retry on
-  transient connection errors
+  transient connection errors. A `429`, `502`, `503` or `504` reply is retried
+  up to twice, waiting as long as the server asks (`Retry-After`, capped at
+  30 seconds) or 2 then 4 seconds
+- If a platform fails to answer for three devices in a row, the script stops
+  syncing that platform, reports the rest as "Not attempted" and exits with
+  code `3`, rather than waiting out a timeout for every remaining device
+- Firewalla entries that can't be used (no name, invalid MAC, unexpected
+  format) are counted on an `Ignored … Firewalla entries` line. VPN peers,
+  which have no MAC, are counted here; `--quiet` hides the line
 - An authentication or API error stops only the affected platform; the
   remaining platforms still sync, and the exit code reports the error
 
